@@ -6,16 +6,16 @@ using System.Runtime.CompilerServices;
 
 namespace IndexFriendlyCollections;
 
-internal readonly struct IndexAccessPool<T> : IDisposable
+public readonly struct IndexAccessPool<T> : IDisposable
     where T : class
 {
     private const int sizeSelector = int.MinValue;
     private readonly (T?[]? items, int count)[] pool;
     private readonly (GCHandle[] items, int count)[] lohPool;
 
-    internal readonly bool IsNull
+    public readonly bool IsNull
         => this.pool is null;
-    internal IndexAccessPool(int maxIndexSize, int lohBorderIndex = 0, int defaultPoolSize = 1, ReadOnlySpan<int> initialPoolLengthsOfIndex = default)
+    public IndexAccessPool(int maxIndexSize, int lohBorderIndex = 0, int defaultPoolSize = 1, ReadOnlySpan<int> initialPoolLengthsOfIndex = default)
     {
         int size;
         if (maxIndexSize <= lohBorderIndex)
@@ -60,7 +60,7 @@ internal readonly struct IndexAccessPool<T> : IDisposable
         this.lohPool = lohPool;
     }
 
-    internal readonly bool TryRent(int index, [MaybeNullWhen(false)] out T item, ReadOnlySpan<int> alternateIndexes = default)
+    public readonly bool TryRent(int index, [MaybeNullWhen(false)] out T item, ReadOnlySpan<int> alternateIndexes = default)
     {
         var p = this.pool;
         var loh = this.lohPool;
@@ -120,7 +120,7 @@ internal readonly struct IndexAccessPool<T> : IDisposable
                 try
                 {
 #endif
-                    lohPool = Interlocked.Exchange(ref location.items, null!);
+                lohPool = Interlocked.Exchange(ref location.items, null!);
                 if (lohPool is null)
                     conflicted = true;
                 else
@@ -179,7 +179,7 @@ internal readonly struct IndexAccessPool<T> : IDisposable
         } while (true);
     }
 
-    internal readonly bool Return(int index, T item, ReadOnlySpan<int> alternateIndexes = default)
+    public readonly bool Return(int index, T item, ReadOnlySpan<int> alternateIndexes = default)
     {
         var p = this.pool;
         var loh = this.lohPool;
@@ -266,12 +266,11 @@ internal readonly struct IndexAccessPool<T> : IDisposable
                         }
                     }
 
-                    for (var i = lohPool.Length - 1; (uint)i < (uint)lohPool.Length; --i)
+                    for (var i = lohPool.Length; (uint)i < (uint)lohPool.Length; --i)
                     {
                         if (!lohPool[i].IsAllocated)
                         {
                             lohPool[i] = GCHandle.Alloc(item, GCHandleType.Weak);
-                            location.count = i + 1;
 #if !EXCEPTIONSAFE
                             Volatile.Write(ref location.items, lohPool);
 #endif
@@ -281,7 +280,6 @@ internal readonly struct IndexAccessPool<T> : IDisposable
                         if (lohPool[i].Target is null)
                         {
                             lohPool[i].Target = item;
-                            location.count = i + 1;
 #if !EXCEPTIONSAFE
                             Volatile.Write(ref location.items, lohPool);
 #endif
@@ -341,7 +339,7 @@ internal readonly struct IndexAccessPool<T> : IDisposable
             }
             finally
             {
-                if(items is not null)
+                if (items is not null)
                     Volatile.Write(ref pool.items, items);
             }
         }
