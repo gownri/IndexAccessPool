@@ -1,66 +1,69 @@
-﻿using System;
+﻿#define UNFORESEENTHROWNFALLBACK
+//#define EXCEPTIONSAFE
+using System;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Runtime.CompilerServices;
+using System.Diagnostics;
 
 namespace IndexFriendlyCollections;
 
 public readonly struct IndexAccessPool<T> : IDisposable
     where T : class
 {
-    private const int sizeSelector = int.MinValue;
-    private readonly (T?[]? items, int count)[] pool;
-    private readonly (GCHandle[] items, int count)[] lohPool;
+    internal static bool IsSupported { get; } = Unsafe.SizeOf<(int, int)>() == 8 ? true : throw new NotSupportedException();
+
+    private const int fallbackArraySize = 1;
+    private const int fallbackThreshold = 40000;
+
+    private readonly (T?[]? items, (int count, int conflictionCount) counts)[] pool;
+    private readonly (GCHandle[]? items, (int count, int conflictionCount) counts)[] lohPool;
 
     public readonly bool IsNull
         => this.pool is null;
-    public IndexAccessPool(int maxIndexSize, int lohBorderIndex = 0, int defaultPoolSize = 1, ReadOnlySpan<int> initialPoolLengthsOfIndex = default)
+    public readonly int Length
+        => this.pool.Length + this.lohPool.Length;
+    public readonly int LOHBorderIndex
+        => this.pool.Length;
+    public IndexAccessPool(int length, int lohBorderIndex = -1, int defaultPoolSize = 1, scoped ReadOnlySpan<int> poolSizeOfIndexes = default)
     {
-        int size;
-        if (maxIndexSize <= lohBorderIndex)
-            this.pool = [];
+        var lohLength = length - lohBorderIndex;
+        if ((long)length < (long)(uint)lohLength)
+        {
+            this.pool = Init<T?>(length, defaultPoolSize, poolSizeOfIndexes);
+            this.lohPool = [];
+        }
         else
         {
-            var poolOfIndex = new (T?[]?, int)[lohBorderIndex];
-            for (var i = 0; i < poolOfIndex.Length; i++)
+            this.pool = Init<T?>(lohBorderIndex, defaultPoolSize, poolSizeOfIndexes);
+            if ((uint)lohBorderIndex < (uint)poolSizeOfIndexes.Length)
+                poolSizeOfIndexes = poolSizeOfIndexes[lohBorderIndex..];
+            else
+                poolSizeOfIndexes = default;
+            this.lohPool = Init<GCHandle>(lohLength, defaultPoolSize, poolSizeOfIndexes);
+        }
+
+        static (U[]?, (int, int))[] Init<U>(int length, int defaultPoolSize, ReadOnlySpan<int> sizeOfIndex)
+        {
+            if (length <= 0)
+                return [];
+            var pool = new (U[]?, (int, int))[length];
+            int size;
+            for (var i = 0; i < pool.Length; i++)
             {
-                if ((uint)i < (uint)initialPoolLengthsOfIndex.Length)
-                    size = (byte)initialPoolLengthsOfIndex[i];
+                if ((uint)i < (uint)sizeOfIndex.Length)
+                    size = sizeOfIndex[i];
                 else
                     size = defaultPoolSize;
 
-                poolOfIndex[i] = (size > 0 ? new T[size] : [], 0);
+                pool[i] = (size > 0 ? new U[size] : [], (0, 0));
             }
-
-            this.pool = poolOfIndex;
+            return pool;
         }
-
-        maxIndexSize -= lohBorderIndex;
-        if (maxIndexSize <= 0)
-        {
-            this.lohPool = [];
-            return;
-        }
-
-        var lohPool = new (GCHandle[], int)[maxIndexSize];
-        if ((uint)maxIndexSize < (uint)initialPoolLengthsOfIndex.Length)
-            initialPoolLengthsOfIndex = initialPoolLengthsOfIndex[maxIndexSize..];
-
-        for (var i = 0; i < lohPool.Length; i++)
-        {
-            if ((uint)i < (uint)initialPoolLengthsOfIndex.Length)
-                size = (byte)initialPoolLengthsOfIndex[i];
-            else
-                size = defaultPoolSize;
-
-            lohPool[i] = (size > 0 ? new GCHandle[size] : [], 0);
-        }
-
-        this.lohPool = lohPool;
     }
 
-    public readonly bool TryRent(int index, [MaybeNullWhen(false)] out T item, ReadOnlySpan<int> alternateIndexes = default)
+    public readonly bool TryRent(int index, [MaybeNullWhen(false)] scoped out T item, scoped ReadOnlySpan<int> alternateIndexes = default)
     {
         var p = this.pool;
         var loh = this.lohPool;
@@ -80,15 +83,20 @@ public readonly struct IndexAccessPool<T> : IDisposable
 #endif
                 pool = Interlocked.Exchange(ref location.items, null!);
                 if (pool is null)
+                {
                     conflicted = true;
+#if UNFORESEENTHROWNFALLBACK
+                    UnforeseenThrownFallback(ref location, this.pool);
+#endif
+                }
                 else
                 {
-                    for (var i = location.count - 1; (uint)i < (uint)pool.Length; --i)
+                    for (var i = location.counts.count - 1; (uint)i < (uint)pool.Length; --i)
                     {
                         var temp = pool[i];
                         if (temp is not null)
                         {
-                            location.count = i;
+                            location.counts = (i, 0);
                             pool[i] = default;
 #if !EXCEPTIONSAFE
                             Volatile.Write(ref location.items, pool);
@@ -111,21 +119,26 @@ public readonly struct IndexAccessPool<T> : IDisposable
 #endif
             }
 
-            idx = index - p.Length;
+            idx -= p.Length;
             if ((uint)idx < (uint)loh.Length)
             {
                 ref var location = ref loh[idx];
-                GCHandle[] lohPool = default!;
+                GCHandle[]? lohPool = default!;
 #if EXCEPTIONSAFE
                 try
                 {
 #endif
                 lohPool = Interlocked.Exchange(ref location.items, null!);
                 if (lohPool is null)
+                { 
                     conflicted = true;
+#if UNFORESEENTHROWNFALLBACK
+                    UnforeseenThrownFallback(ref location, this.lohPool);
+#endif
+                }
                 else
                 {
-                    for (var i = location.count - 1; (uint)i < (uint)lohPool.Length; --i)
+                    for (var i = location.counts.count - 1; (uint)i < (uint)lohPool.Length; --i)
                     {
                         if (!lohPool[i].IsAllocated)
                             continue;
@@ -133,7 +146,7 @@ public readonly struct IndexAccessPool<T> : IDisposable
                         var temp = lohPool[i].Target;
                         if (temp is not null)
                         {
-                            location.count = i;
+                            location.counts = (i, 0);
                             lohPool[i].Target = null;
 #if !EXCEPTIONSAFE
                             Volatile.Write(ref location.items, lohPool);
@@ -166,6 +179,8 @@ public readonly struct IndexAccessPool<T> : IDisposable
                 if (conflicted)
                 {
                     altRead = 0;
+                    idx = index;
+                    conflicted = false;
                     if (extend)
                         Thread.Sleep(0);
                     else
@@ -179,7 +194,7 @@ public readonly struct IndexAccessPool<T> : IDisposable
         } while (true);
     }
 
-    public readonly bool Return(int index, T item, ReadOnlySpan<int> alternateIndexes = default)
+    public readonly bool Return(int index, T item, scoped ReadOnlySpan<int> alternateIndexes = default)
     {
         var p = this.pool;
         var loh = this.lohPool;
@@ -199,16 +214,21 @@ public readonly struct IndexAccessPool<T> : IDisposable
                 try
                 {
 #endif
-                pool = Interlocked.Exchange(ref location.items, null!);
+                pool = Interlocked.Exchange(ref location.items, null);
                 if (pool is null)
+                {
                     conflicted = true;
+#if UNFORESEENTHROWNFALLBACK
+                    UnforeseenThrownFallback(ref location, this.pool);
+#endif
+                }
                 else
                 {
-                    for (var i = location.count; (uint)i < (uint)pool.Length; ++i)
+                    for (var i = location.counts.count; (uint)i < (uint)pool.Length; ++i)
                     {
                         if (pool[i] is null)
                         {
-                            location.count = i + 1;
+                            location.counts = (i + 1, 0);
                             pool[i] = item;
 #if !EXCEPTIONSAFE
                             Volatile.Write(ref location.items, pool);
@@ -233,22 +253,27 @@ public readonly struct IndexAccessPool<T> : IDisposable
             if ((uint)idx < (uint)loh.Length)
             {
                 ref var location = ref loh[idx];
-                GCHandle[] lohPool = default!;
+                GCHandle[]? lohPool = default!;
 #if EXCEPTIONSAFE
                 try
                 {
 #endif
-                lohPool = Interlocked.Exchange(ref location.items, null!);
+                lohPool = Interlocked.Exchange(ref location.items, null);
                 if (lohPool is null)
+                {
                     conflicted = true;
+#if UNFORESEENTHROWNFALLBACK
+                    UnforeseenThrownFallback(ref location, this.lohPool);
+#endif
+                }
                 else
                 {
-                    for (var i = location.count; (uint)i < (uint)lohPool.Length; ++i)
+                    for (var i = location.counts.count; (uint)i < (uint)lohPool.Length; ++i)
                     {
                         if (!lohPool[i].IsAllocated)
                         {
                             lohPool[i] = GCHandle.Alloc(item, GCHandleType.Weak);
-                            location.count = i + 1;
+                            location.counts = (i + 1, 0);
 #if !EXCEPTIONSAFE
                             Volatile.Write(ref location.items, lohPool);
 #endif
@@ -258,7 +283,7 @@ public readonly struct IndexAccessPool<T> : IDisposable
                         if (lohPool[i].Target is null)
                         {
                             lohPool[i].Target = item;
-                            location.count = i + 1;
+                            location.counts = (i + 1, 0);
 #if !EXCEPTIONSAFE
                             Volatile.Write(ref location.items, lohPool);
 #endif
@@ -266,11 +291,12 @@ public readonly struct IndexAccessPool<T> : IDisposable
                         }
                     }
 
-                    for (var i = lohPool.Length; (uint)i < (uint)lohPool.Length; --i)
+                    for (var i = lohPool.Length - 1; (uint)i < (uint)lohPool.Length; --i)
                     {
                         if (!lohPool[i].IsAllocated)
                         {
                             lohPool[i] = GCHandle.Alloc(item, GCHandleType.Weak);
+                            location.counts.conflictionCount = 0;
 #if !EXCEPTIONSAFE
                             Volatile.Write(ref location.items, lohPool);
 #endif
@@ -280,12 +306,16 @@ public readonly struct IndexAccessPool<T> : IDisposable
                         if (lohPool[i].Target is null)
                         {
                             lohPool[i].Target = item;
+                            location.counts.conflictionCount = 0;
 #if !EXCEPTIONSAFE
                             Volatile.Write(ref location.items, lohPool);
 #endif
                             return true;
                         }
                     }
+#if !EXCEPTIONSAFE
+                    Volatile.Write(ref location.items, lohPool);
+#endif
                 }
 #if EXCEPTIONSAFE
                 }
@@ -304,9 +334,11 @@ public readonly struct IndexAccessPool<T> : IDisposable
             }
             else
             {
-                altRead = 0;
                 if (conflicted)
                 {
+                    altRead = 0;
+                    idx = index;
+                    conflicted = false;
                     if (extend)
                         Thread.Sleep(0);
                     else
@@ -320,22 +352,47 @@ public readonly struct IndexAccessPool<T> : IDisposable
 
 
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void UnforeseenThrownFallback<U>(scoped ref (U[]? items, (int count, int conflictions) counts) location, object lockObj, [CallerLineNumber] int line = 0)
+    {
+        if (Interlocked.Increment(ref location.counts.conflictions) < fallbackThreshold)
+            return;
+        Debug.WriteLine($"fallback by (count, conflictions) : [{location.counts}] in {line}");
+        lock(lockObj)
+        {
+            if(location.counts.conflictions < fallbackThreshold)
+                return;
+            var array = new U[fallbackArraySize];
+            location.items = array;
+            location.counts.count = 0;
+            Volatile.Write(ref location.counts.conflictions, 0);
+        }
+    }
     public readonly void Dispose()
     {
+        var count = 0;
         foreach (ref var pool in this.pool.AsSpan())
         {
             T?[]? items = default;
             try
             {
-                items = Interlocked.Exchange(ref pool.items, null!);
-                while (items is null)
+                while (true)
                 {
-                    Thread.Sleep(0);
                     items = Interlocked.Exchange(ref pool.items, null!);
+                    if (items is null)
+                    {
+                        if (count++ > fallbackThreshold)
+                            break;
+                        Thread.Sleep(0);
+                        continue;
+                    }
+
+                    foreach (ref var item in items.AsSpan())
+                        item = null;
+                    pool.counts = default;
+                    break;
                 }
-                foreach (ref var item in items.AsSpan())
-                    item = null;
-                pool.count = 0;
             }
             finally
             {
@@ -344,21 +401,28 @@ public readonly struct IndexAccessPool<T> : IDisposable
             }
         }
 
+        count = 0;
         foreach (ref var pool in this.lohPool.AsSpan())
         {
             GCHandle[]? items = default;
             try
             {
-                items = Interlocked.Exchange(ref pool.items, null!);
-                while (items is null)
+                while (true)
                 {
-                    Thread.Sleep(0);
                     items = Interlocked.Exchange(ref pool.items, null!);
+                    if (items is null)
+                    {
+                        if (count++ > fallbackThreshold)
+                            break;
+                        Thread.Sleep(0);
+                        continue;
+                    }
+                    foreach (ref var gcHandle in items.AsSpan())
+                        if (gcHandle.IsAllocated)
+                            gcHandle.Free();
+                    pool.counts = default;
+                    break;
                 }
-                foreach (ref var gcHandle in items.AsSpan())
-                    if (gcHandle.IsAllocated)
-                        gcHandle.Free();
-                pool.count = 0;
             }
             finally
             {
@@ -368,5 +432,104 @@ public readonly struct IndexAccessPool<T> : IDisposable
         }
     }
 
+    public readonly string DEBUG__PoolsDump()
+    {
+        var sb = new System.Text.StringBuilder();
+
+        sb.AppendLine($"{nameof(IndexAccessPool<T>)} : {this.Length}");
+        if (this.IsNull)
+            return sb.ToString();
+        var offset = 0;
+        sb.Append("pool : ")
+            .Append(this.pool.Length)
+        .AppendLine();
+        {
+            var pool = this.pool;
+            for (var i = 0; i < pool.Length; ++i)
+            {
+                sb.Append("\tindexOf:")
+                    .Append(i + offset)
+                    .Append(", ");
+                var items = pool[i].items;
+                if (items is null)
+                    sb.Append("items:null");
+                else
+                {
+                    sb.Append("items:[");
+                    foreach (var item in items)
+                    {
+                        sb.Append(
+                            item
+                        )
+                        .Append(", ");
+                    }
+                    sb.Append("] in ")
+                    .Append(items.Length);
+                }
+                sb.Append(", count:")
+                    .Append(pool[i].counts.count)
+                    .Append(" || conflicts:")
+                    .Append(pool[i].counts.conflictionCount)
+                .AppendLine();
+            }
+        }
+
+        offset = this.pool.Length;
+        sb.Append("lohPool : ")
+            .Append(this.lohPool.Length)
+        .AppendLine();
+        {
+            var pool = this.lohPool;
+            for (var i = 0; i < pool.Length; ++i)
+            {
+                sb.Append("\tindexOf:")
+                    .Append(i + offset)
+                .Append(", ");
+                var items = pool[i].items;
+                if (items is null)
+                    sb.Append("items is null");
+                else
+                {
+                    sb.Append("items:[");
+                    foreach (var item in items)
+                    {
+                        sb.Append(
+                            item.IsAllocated ? item.Target : "null"
+                        )
+                        .Append(", ");
+                    }
+                    sb.Append("] in ")
+                    .Append(items.Length);
+                }
+                sb.Append(", count:")
+                    .Append(pool[i].counts.count)
+                    .Append(" || conflicts:")
+                    .Append(pool[i].counts.conflictionCount)
+                .AppendLine();
+            }
+        }
+
+        return sb.ToString();
+    }
 }
 
+/*
+test code
+
+using IndexFriendlyCollections;
+using System.Threading;
+var pool = new IndexAccessPool<object>(32, 20, 4);
+
+{
+    Parallel.For(0, 10000, v =>
+{
+    if (!pool.TryRent(v % 31, out var a))
+        a = (object)v;
+    System.Threading.Thread.Sleep(0);
+    pool.Return(v % 31, a);
+}
+);
+        Console.WriteLine(pool.DEBUG__DumpPools());
+}
+
+*/
