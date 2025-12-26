@@ -12,8 +12,6 @@ namespace IndexFriendlyCollections;
 public readonly struct IndexAccessPool<T> : IDisposable
     where T : class
 {
-    internal static bool IsSupported { get; } = Unsafe.SizeOf<(int, int)>() == 8 ? true : throw new NotSupportedException();
-
     private const int fallbackArraySize = 1;
     private const int fallbackThreshold = 40000;
 
@@ -352,6 +350,7 @@ public readonly struct IndexAccessPool<T> : IDisposable
 
 
     }
+#if UNFORESEENTHROWNFALLBACK
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void UnforeseenThrownFallback<U>(scoped ref (U[]? items, (int count, int conflictions) counts) location, object lockObj, [CallerLineNumber] int line = 0)
@@ -369,6 +368,7 @@ public readonly struct IndexAccessPool<T> : IDisposable
             Volatile.Write(ref location.counts.conflictions, 0);
         }
     }
+#endif
     public readonly void Dispose()
     {
         var count = 0;
